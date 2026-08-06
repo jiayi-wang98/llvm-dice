@@ -1498,7 +1498,19 @@ bool NVPTXDAGToDAGISel::tryStoreVector(SDNode *N) {
 
 /// SelectBFE - Look for instruction sequences that can be made more efficient
 /// by using the 'bfe' (bit-field extract) PTX instruction
+// DICE: the target fabric has no bit-field-extract unit. bfe/bfi are a single
+// PTX instruction with no equivalent in a PE built from an ALU, a comparator
+// and a bitwise unit, and expanding them after the fact means undoing a
+// codegen decision that was made for a GPU. Suppressing selection here makes
+// ISel fall back to the shift/and sequences the fabric can already execute.
+static llvm::cl::opt<bool> NVPTXNoBFE(
+    "nvptx-no-bfe", llvm::cl::init(false), llvm::cl::Hidden,
+    llvm::cl::desc("Do not select the BFE instruction; emit shifts and masks "
+                   "instead (for targets without a bit-field unit)"));
+
 bool NVPTXDAGToDAGISel::tryBFE(SDNode *N) {
+  if (NVPTXNoBFE)
+    return false;
   SDLoc DL(N);
   SDValue LHS = N->getOperand(0);
   SDValue RHS = N->getOperand(1);

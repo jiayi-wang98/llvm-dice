@@ -36,7 +36,14 @@ enum class VirtualRegisterKind : unsigned {
   B32 = 3,
   B64 = 4,
   B128 = 5,
+  // A DICE architectural register (NVPTXDiceRegAlloc ran). The class lives
+  // in the top two bits of the number field: 0=%r, 1=%c, 2=%p, 3=%w.
+  Dice = 6,
 };
+
+constexpr unsigned DiceClassShift = 25;
+constexpr unsigned DiceClassMask = 3u << DiceClassShift;
+constexpr char DiceClassChars[4] = {'r', 'c', 'p', 'w'};
 
 constexpr unsigned VirtualRegisterKindShift = 27;
 constexpr unsigned VirtualRegisterNumMask =

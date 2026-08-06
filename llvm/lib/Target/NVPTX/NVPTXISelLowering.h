@@ -50,6 +50,26 @@ public:
                              unsigned AS,
                              Instruction *I = nullptr) const override;
 
+  /// DICE: never re-narrow a 32-bit load back to 8/16 bits.
+  ///
+  /// `NVPTXDiceWidenSubword` widens every sub-word load on LLVM IR to a 32-bit
+  /// load plus a trunc, because a DICE memory port is 32 bits, carries no access
+  /// size and has no byte enable: the hardware transfers 4 bytes whatever the
+  /// PTX says. DAGCombiner's ReduceLoadWidth then recognises `trunc(load i32)`
+  /// and folds it straight back into `ld.global.u8`, undoing the pass and
+  /// re-emitting the one instruction the fabric cannot execute. It is a
+  /// profitability hook, so saying "not profitable" is the correct way to
+  /// express "not representable". Same shape as the `-nvptx-no-bfe` suppression
+  /// in NVPTXISelDAGToDAG.
+  bool shouldReduceLoadWidth(
+      SDNode *Load, ISD::LoadExtType ExtTy, EVT NewVT,
+      std::optional<unsigned> ByteOffset = std::nullopt) const override {
+    if (nvptxDiceEnabled() && !NewVT.isVector() &&
+        NewVT.isScalarInteger() && NewVT.getScalarSizeInBits() < 32)
+      return false;
+    return TargetLowering::shouldReduceLoadWidth(Load, ExtTy, NewVT, ByteOffset);
+  }
+
   bool isTruncateFree(Type *SrcTy, Type *DstTy) const override {
     // Truncating 64-bit to 32-bit is free in SASS.
     if (!SrcTy->isIntegerTy() || !DstTy->isIntegerTy())

@@ -37,6 +37,7 @@
 #include "llvm/Transforms/IPO/ExpandVariadics.h"
 #include "llvm/Transforms/Scalar.h"
 #include "llvm/Transforms/Scalar/GVN.h"
+#include "llvm/Transforms/Scalar/Scalarizer.h"
 #include "llvm/Transforms/Vectorize/LoadStoreVectorizer.h"
 #include <cassert>
 #include <optional>
@@ -191,6 +192,7 @@ public:
   void addPreRegAlloc() override;
   void addPostRegAlloc() override;
   void addMachineSSAOptimization() override;
+  void addPreEmitPass() override;
 
   FunctionPass *createTargetRegisterAllocator(bool) override;
   void addFastRegAlloc() override;
@@ -396,7 +398,22 @@ void NVPTXPassConfig::addIRPasses() {
   // but EarlyCSE can do neither of them.
   if (getOptLevel() != CodeGenOptLevel::None) {
     addEarlyCSEOrGVNPass();
-    if (!DisableLoadStoreVectorizer)
+    if (nvptxDiceEnabled()) {
+      // DICE has no vector LDST: a v4 load is four ports, one whole
+      // p-graph budget. Rather than emit vector memops and split them
+      // back apart, never form them -- skip the vectorizer, and scalarize
+      // the vector loads/stores the SOURCE wrote (Parboil's float4).
+      ScalarizerPassOptions SPO;
+      SPO.ScalarizeLoadStore = true;
+      addPass(createScalarizerPass(SPO));
+      // DICE has no access-size field and no byte enable: a memory port is 32
+      // bits and a load returns the four bytes AT its byte address. Widen 8/16
+      // bit loads to a 32-bit load plus a trunc here, so the mask is in the
+      // program instead of being a wrong answer on the fabric. Must run before
+      // the instcombine that follows, which folds zext(trunc)/sext(trunc) into
+      // the and/shl+ashr sequences the fabric's ALU can execute.
+      addPass(createNVPTXDiceWidenSubwordPass());
+    } else if (!DisableLoadStoreVectorizer)
       addPass(createLoadStoreVectorizerPass());
     addPass(createSROAPass(/*PreserveCFG=*/true,
                            /*AggregateToVector=*/true));
@@ -439,6 +456,21 @@ void NVPTXPassConfig::addPostRegAlloc() {
     // will replace VRFrame with VRFrameLocal when possible.
     addPass(createNVPTXPeephole());
   }
+}
+
+void NVPTXPassConfig::addPreEmitPass() {
+  // DICE optimization passes: each is a no-op unless its
+  // -nvptx-dice-opt-<name> flag is set (dicc --dice-opt <name>), so the
+  // flagless pipeline is byte-for-byte the frozen baseline.
+  addPass(createNVPTXDiceIfConvertPass());
+  // Clusters loads ahead of their uses; a no-op unless -nvptx-dice-opt-loadsched.
+  addPass(createNVPTXDiceLoadSchedPass());
+  // Splits blocks into DICE p-graphs; a no-op unless -nvptx-dice-partition.
+  addPass(createNVPTXDicePartitionPass());
+  // Fuses adjacent p-graphs; a no-op unless -nvptx-dice-opt-fuse.
+  addPass(createNVPTXDiceFusePass());
+  // Assigns DICE architectural registers; a no-op unless -nvptx-dice-regalloc.
+  addPass(createNVPTXDiceRegAllocPass());
 }
 
 FunctionPass *NVPTXPassConfig::createTargetRegisterAllocator(bool) {

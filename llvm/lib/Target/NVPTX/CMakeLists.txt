@@ -34,6 +34,11 @@ set(NVPTXCodeGen_sources
   NVPTXLowerUnreachable.cpp
   NVPTXMCExpr.cpp
   NVPTXMarkKernelPtrsGlobal.cpp
+  NVPTXDiceIfConvert.cpp
+  NVPTXDiceLoadSched.cpp
+  NVPTXDicePartition.cpp
+  NVPTXDiceRegAlloc.cpp
+  NVPTXDiceWidenSubword.cpp
   NVPTXPeephole.cpp
   NVPTXPrologEpilogPass.cpp
   NVPTXPromoteParamAlign.cpp

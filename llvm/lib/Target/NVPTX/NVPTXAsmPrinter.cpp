@@ -578,6 +578,16 @@ static SmallVector<const GlobalVariable *, 4> orderDefinitionsInSCC(
 } // namespace
 
 void NVPTXAsmPrinter::emitInstruction(const MachineInstr *MI) {
+  // DICE predication guard from if-conversion: emit as a trailing marker
+  // comment; dicc rewrites it into the @%p prefix (PTX has no MC-level
+  // predication, and a raw-text prefix cannot share the MCStreamer's line).
+  if (const auto *NMFI = MF->getInfo<NVPTXMachineFunctionInfo>())
+    if (const auto *G = NMFI->getDicePredGuard(MI)) {
+      const std::string *PName = NMFI->getDiceRegName(G->first);
+      std::string N = PName ? *PName : getVirtualRegisterName(G->first);
+      OutStreamer->AddComment(Twine("DICE_PRED @") +
+                              (G->second ? "!" : "") + N);
+    }
   NVPTX_MC::verifyInstructionPredicates(MI->getOpcode(),
                                         getSubtargetInfo().getFeatureBits());
 
@@ -663,6 +673,16 @@ unsigned NVPTXAsmPrinter::getVirtualRegisterNumber(Register Reg) const {
 
 MCRegister NVPTXAsmPrinter::encodeVirtualRegister(Register Reg) {
   if (Reg.isVirtual()) {
+    // A DICE assignment overrides the per-class virtual numbering.
+    if (const auto *NMFI = MF->getInfo<NVPTXMachineFunctionInfo>())
+      if (const std::string *Name = NMFI->getDiceRegName(Reg)) {
+        unsigned Cls = StringRef("rcpw").find((*Name)[1]);
+        unsigned Idx = 0;
+        StringRef(*Name).drop_front(2).getAsInteger(10, Idx);
+        return (static_cast<unsigned>(NVPTX::VirtualRegisterKind::Dice)
+                << NVPTX::VirtualRegisterKindShift) |
+               (Cls << NVPTX::DiceClassShift) | Idx;
+      }
     // Pack the register class into the upper bits so that
     // NVPTXInstPrinter::printRegName can recover the declared name.
     const auto Kind = getVirtualRegisterKind(MRI->getRegClass(Reg));
@@ -945,6 +965,13 @@ void NVPTXAsmPrinter::emitFunctionBodyStart() {
 }
 
 void NVPTXAsmPrinter::emitFunctionBodyEnd() {
+  if (const auto *NMFI = MF->getInfo<NVPTXMachineFunctionInfo>();
+      NMFI && !NMFI->getDiceMetaText().empty()) {
+    SmallVector<StringRef, 64> Lines;
+    StringRef(NMFI->getDiceMetaText()).split(Lines, '\n');
+    for (StringRef L : Lines)
+      OutStreamer->emitRawText(Twine("// DICE_META ") + L);
+  }
   VRegMapping.clear();
 }
 
@@ -1032,6 +1059,11 @@ void NVPTXAsmPrinter::emitKernelFunctionDirectives(const Function &F,
 }
 
 std::string NVPTXAsmPrinter::getVirtualRegisterName(Register Reg) const {
+  // NVPTXDiceRegAlloc's assignment, when it ran, IS the register name:
+  // %r/%c/%p/%w with real indices the DICE fabric banks on.
+  if (const auto *NMFI = MF->getInfo<NVPTXMachineFunctionInfo>())
+    if (const std::string *Name = NMFI->getDiceRegName(Reg))
+      return *Name;
   const auto Kind = getVirtualRegisterKind(MRI->getRegClass(Reg));
 
   std::string Name;
@@ -2078,6 +2110,26 @@ void NVPTXAsmPrinter::setAndEmitFunctionVirtualRegisters(
       continue;
     auto &RCRegMap = VRegMapping[MRI->getRegClass(VR)];
     RCRegMap[VR] = RCRegMap.size() + 1;
+  }
+
+  // With a DICE assignment, declarations describe the architectural
+  // classes, sized by what the allocator actually used.
+  if (const auto *NMFI = MF.getInfo<NVPTXMachineFunctionInfo>();
+      NMFI && NMFI->hasDiceRegNames()) {
+    ArrayRef<unsigned> Counts = NMFI->getDiceRegCounts(); // r, c, p, w
+    // Actual-use counts, deliberately: the header doubles as a register
+    // pressure report. The simulator's register-to-bank mapping must
+    // derive bank indices from the register's class and number, never
+    // from its position in the declaration order.
+    if (Counts[0])
+      TS->emitRegDirective(32, "%r", Counts[0] + 1);
+    if (Counts[1])
+      TS->emitRegDirective(32, "%c", Counts[1] + 1);
+    if (Counts[2])
+      TS->emitRegDirective(1, "%p", Counts[2] + 1);
+    if (Counts[3])
+      TS->emitRegDirective(32, "%w", Counts[3] + 1);
+    return;
   }
 
   // Emit declaration of the virtual registers or 'physical' registers for
