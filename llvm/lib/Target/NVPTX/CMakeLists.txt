@@ -34,6 +34,7 @@ set(NVPTXCodeGen_sources
   NVPTXLowerUnreachable.cpp
   NVPTXMCExpr.cpp
   NVPTXMarkKernelPtrsGlobal.cpp
+  NVPTXDiceFP64Lower.cpp
   NVPTXDiceIfConvert.cpp
   NVPTXDiceLoadSched.cpp
   NVPTXDicePartition.cpp

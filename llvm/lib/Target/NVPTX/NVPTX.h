@@ -49,6 +49,7 @@ MachineFunctionPass *createNVPTXPrologEpilogPass();
 MachineFunctionPass *createNVPTXDiceIfConvertPass();
 MachineFunctionPass *createNVPTXDiceLoadSchedPass();
 MachineFunctionPass *createNVPTXDicePartitionPass();
+MachineFunctionPass *createNVPTXDiceFP64LowerPass();
 MachineFunctionPass *createNVPTXDiceFusePass();
 MachineFunctionPass *createNVPTXDiceRegAllocPass();
 FunctionPass *createNVPTXDiceWidenSubwordPass();

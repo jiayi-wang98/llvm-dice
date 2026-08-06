@@ -208,6 +208,32 @@ static Cost classify(const MachineInstr &MI, const TargetInstrInfo &TII,
       Name.starts_with("INT_PTX_SREG"))
     return C;
 
+  // fp64 COSTS AN SFU TILE, and this line was missing until 2026-08-06.
+  //
+  // Only the four `pe_sfu` tiles carry the width-64 fpnew instance
+  // (device-contract.md 5.5e); the twenty ALU tiles have the 32-bit one and
+  // nothing else. `dicemap.pgraph.classify_op_class` has said so since the
+  // fp64 unit was built -- anything whose PTX text contains `.f64` is
+  // op_class `float64`, capable on `sfu` only -- and the PARTITIONER did not
+  // agree: it charged an ordinary PE and let a p-graph hold as many fp64 ops
+  // as it had PE tiles.
+  //
+  // It went unnoticed because it needed a p-graph with FIVE fp64 ops to bite,
+  // and while `fma.rn.f64` was one instruction backprop's worst block had
+  // exactly four. Lowering the FMA (NVPTXDiceFP64Lower) turns one op into two
+  // and made `DICE_BB1_8` and `DICE_BB1_15` need five SFU tiles of the four
+  // that exist -- the mapper reported `resource_oversubscribed`, which is the
+  // right answer to the wrong question: the partitioner should have split
+  // them. Measured on backprop and hotspot.
+  //
+  // The predicate mirrors the mapper's `_WIDE_FLOAT_TY = \.f64\b`: any
+  // operation whose PTX names `.f64`. `MOV`/`CVTA` are already free above, so
+  // an fp64 register copy stays free exactly as the mapper's fold makes it.
+  if (Name.contains("f64") || Name.contains("F64")) {
+    C.SFU = 1;
+    return C;
+  }
+
   C.PE = 1;
   return C;
 }

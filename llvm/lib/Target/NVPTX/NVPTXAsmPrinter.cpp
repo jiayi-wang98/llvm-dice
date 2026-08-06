@@ -965,6 +965,14 @@ void NVPTXAsmPrinter::emitFunctionBodyStart() {
 }
 
 void NVPTXAsmPrinter::emitFunctionBodyEnd() {
+  // DICE qualifications first, so they sit with the function body they
+  // describe rather than after the metadata block. They are ordinary PTX
+  // comments; dicc leaves them in the .pptx (only `// DICE_META` lines are
+  // split out), which is what makes the deviation travel with the artifact
+  // instead of only with the build log.
+  if (const auto *NMFI = MF->getInfo<NVPTXMachineFunctionInfo>(); NMFI)
+    for (const std::string &Q : NMFI->getDiceQualifications())
+      OutStreamer->emitRawText(Twine("// DICE_QUAL ") + Q);
   if (const auto *NMFI = MF->getInfo<NVPTXMachineFunctionInfo>();
       NMFI && !NMFI->getDiceMetaText().empty()) {
     SmallVector<StringRef, 64> Lines;

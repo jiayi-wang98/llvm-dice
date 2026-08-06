@@ -32,6 +32,13 @@ private:
   /// Rendered .meta records for this function (NVPTXDiceRegAlloc). The asm
   /// printer emits them as trailing DICE_META comments; dicc splits them out.
   std::string DiceMetaText;
+  /// DICE artifact QUALIFICATIONS: things this compilation did that the
+  /// program did not ask for and that the answer depends on. Emitted by the
+  /// asm printer as `// DICE_QUAL` comments -- plain PTX comments, so nothing
+  /// in the simulator's parser or in dicemeta.y has to learn a new record --
+  /// and surfaced by dice-verify and dice-rtlsweep. Today the only producer is
+  /// NVPTXDiceFP64Lower (fma.rn.f64 -> mul + add, which rounds twice).
+  SmallVector<std::string, 2> DiceQualifications;
   /// DICE predication guards from if-conversion: instruction -> (predicate
   /// vreg, negated). The instruction also carries the predicate as an
   /// implicit use so liveness and allocation see it; this table is what the
@@ -69,6 +76,12 @@ public:
   bool hasDicePredGuards() const { return !DicePredGuards.empty(); }
   void setDiceMetaText(std::string T) { DiceMetaText = std::move(T); }
   const std::string &getDiceMetaText() const { return DiceMetaText; }
+  void addDiceQualification(std::string Q) {
+    DiceQualifications.push_back(std::move(Q));
+  }
+  ArrayRef<std::string> getDiceQualifications() const {
+    return DiceQualifications;
+  }
 
   void setDiceRegCounts(unsigned R, unsigned C, unsigned P, unsigned W) {
     DiceCounts[0] = R; DiceCounts[1] = C; DiceCounts[2] = P; DiceCounts[3] = W;

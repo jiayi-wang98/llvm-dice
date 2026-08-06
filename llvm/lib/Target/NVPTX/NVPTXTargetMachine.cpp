@@ -462,6 +462,11 @@ void NVPTXPassConfig::addPreEmitPass() {
   // DICE optimization passes: each is a no-op unless its
   // -nvptx-dice-opt-<name> flag is set (dicc --dice-opt <name>), so the
   // flagless pipeline is byte-for-byte the frozen baseline.
+  // fp64 FMA -> mul + add, BEFORE partitioning: the lowering turns one SFU
+  // tile into two and the partitioner's SFU budget has to see that. The
+  // semantic cost (two roundings where PTX asked for one) is recorded as a
+  // DICE_QUAL comment by the pass; see NVPTXDiceFP64Lower.cpp.
+  addPass(createNVPTXDiceFP64LowerPass());
   addPass(createNVPTXDiceIfConvertPass());
   // Clusters loads ahead of their uses; a no-op unless -nvptx-dice-opt-loadsched.
   addPass(createNVPTXDiceLoadSchedPass());
