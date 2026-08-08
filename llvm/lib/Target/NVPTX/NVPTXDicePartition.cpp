@@ -52,6 +52,8 @@
 #include "llvm/CodeGen/TargetInstrInfo.h"
 #include "llvm/CodeGen/TargetSubtargetInfo.h"
 #include "llvm/Support/CommandLine.h"
+#include "llvm/Support/Debug.h"
+#include "llvm/Support/raw_ostream.h"
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/NVPTXAddrSpace.h"
 
@@ -76,6 +78,12 @@ static cl::opt<bool> EnableDiceFuse(
 static cl::opt<unsigned> DiceLDSTCount(
     "nvptx-dice-ldst-count", cl::init(4), cl::Hidden,
     cl::desc("DICE p-graph LDST port budget"));
+
+static cl::opt<bool> DiceCostDump(
+    "nvptx-dice-cost-dump", cl::init(false), cl::Hidden,
+    cl::desc("Print each p-graph's tile accounting to stderr. The three cost "
+             "models (this pass, dicemap.pgraph, dicevfy C4) must agree, and "
+             "this is how a disagreement is localised to an instruction"));
 
 static cl::opt<unsigned> DiceImmBits(
     "nvptx-dice-imm-bits", cl::init(16), cl::Hidden,
@@ -402,7 +410,21 @@ static Cost classify(const MachineInstr &MI, const TargetInstrInfo &TII,
 
   // Free: address-space casts, integer width changes, movs (the fabric
   // routes them), special-register reads (mov.u32 %r, %tid.x).
-  if (Name.starts_with("CVTA") || isFreeIntWidthCvt(Name) ||
+  //
+  // `cvta` IS MATCHED CASE-INSENSITIVELY, and that is a BUG FIX, not a
+  // tidy-up. NVPTX names the instruction `cvta_to_global_64` -- LOWERCASE --
+  // so `starts_with("CVTA")` never matched and EVERY `cvta` has been charged a
+  // PE since this pass was written, contradicting both this file's own header
+  // comment ("cvta and 32<->64 integer cvt = free") and
+  // dicevfy.ir.is_non_pe, which has always returned True for it. Measured
+  // 2026-08-07 with -nvptx-dice-cost-dump: needle's `needle_cuda_shared_2`
+  // block 11 opens with two `cvta_to_global_64` charged 1 PE each, which took
+  // a p-graph the mapper costs at 16 tiles to 17 and split it. Every other
+  // free-list name really is upper-case (`CVT_u64_u32`, `MOV_B64_sym`,
+  // `INT_PTX_SREG_CTAID_x`), so this is the only one that was wrong -- and it
+  // was wrong in the SAFE direction, which is why it survived: over-charging
+  // only ever produces a smaller p-graph, never an illegal one.
+  if (Name.starts_with_insensitive("cvta") || isFreeIntWidthCvt(Name) ||
       Name.starts_with("MOV") || Name.starts_with("IMOV") ||
       Name.starts_with("INT_PTX_SREG")) {
     // A `mov` is free ROUTING, unless what it names is NOT A REGISTER.
@@ -701,6 +723,13 @@ bool llvm::nvptxDiceRepartition(MachineFunction &MF) {
            (DiceConstReadCount &&
             UsedConsts.size() + NewConsts.size() > DiceConstReadCount));
 
+      if (NeedSplit && DiceCostDump)
+        errs() << "DICE-COST " << MF.getName() << " " << MBB->getNumber()
+               << " SPLIT before " << TII.getName(MI.getOpcode())
+               << " (would be PE=" << (UsedPE + InstPE) << " of "
+               << DicePECount << ", SFU=" << (UsedSFU + C.SFU) << ", LDST="
+               << (UsedLDST + C.LDST) << ", lateDef=" << UsesLateDef
+               << ", barrier=" << C.IsBarrier << ")\n";
       if (NeedSplit) {
         MachineBasicBlock *Tail = MBB->splitAt(*LastReal,
                                                /*UpdateLiveIns=*/false);
@@ -713,6 +742,12 @@ bool llvm::nvptxDiceRepartition(MachineFunction &MF) {
         break;
       }
 
+      if (DiceCostDump)
+        errs() << "DICE-COST " << MF.getName() << " " << MBB->getNumber()
+               << " +PE=" << InstPE << " (op=" << C.PE << " disp=" << C.DispAdds
+               << " mat=" << MatPE << ") +SFU=" << C.SFU
+               << " +LDST=" << C.LDST << " running(PE=" << (UsedPE + InstPE)
+               << ") " << TII.getName(MI.getOpcode()) << "\n";
       UsedPE += InstPE;
       UsedSFU += C.SFU;
       UsedLDST += C.LDST;
