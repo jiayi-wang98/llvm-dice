@@ -279,6 +279,33 @@ static std::optional<uint32_t> literalPattern(const MachineOperand &MO) {
 /// passes `allow_fold = policy.enabled and inst.base_opcode != "selp"`.
 static bool isSelpName(StringRef Name) { return Name.starts_with("SELP_"); }
 
+/// Tiles a SUB-WORD `cvt` occupies: 2 when it sign-extends, 1 when it masks,
+/// 0 when it is not one.
+///
+/// There is no `cvt` in the fabric's op table at all, so `dicemap.pgraph`
+/// lowers it into shifts: `cvt.s32.s8 d, s` becomes `shl.b32 t, s, 24 ;
+/// shr.s32 d, t, 24` -- TWO tiles for one instruction -- and `cvt.u32.u8`
+/// becomes a single `and.b32 d, s, 0xFF`. `isFreeIntWidthCvt` above already
+/// excludes these (8 and 16 are not in its {32, 64}), so without this they were
+/// charged one PE like any other op. m5_bytes's `DICE_BB0_4` is the case.
+///
+/// Names look like `CVT_s32_s8`; the SOURCE type decides sign extension, so
+/// `cvt.s32.u8` masks and `cvt.u32.s8` sign-extends.
+static unsigned subwordCvtTiles(StringRef Name) {
+  if (!Name.consume_front("CVT_"))
+    return 0;
+  auto [Dst, Src] = Name.split('_');
+  if (Dst != "s32" && Dst != "u32")
+    return 0;
+  Src = Src.split('_').first;
+  if (Src.size() < 2 || (Src[0] != 's' && Src[0] != 'u'))
+    return 0;
+  unsigned Width = 0;
+  if (Src.substr(1).getAsInteger(10, Width) || (Width != 8 && Width != 16))
+    return 0;
+  return Src[0] == 's' ? 2 : 1;
+}
+
 /// Tiles a memory access spends on its bracket DISPLACEMENT (0 or 1).
 ///
 /// THE FABRIC IS THE ONLY ADDER. mini_dice's LDST port takes the address
@@ -428,6 +455,13 @@ static Cost classify(const MachineInstr &MI, const TargetInstrInfo &TII,
   }
 
   C.PE = 1;
+
+  if (unsigned CvtTiles = subwordCvtTiles(Name)) {
+    // The lowering resolves only its SOURCE operand and folds both shift
+    // amounts into the tiles' own immediates, so no literal is materialised.
+    C.PE = CvtTiles;
+    return C;
+  }
 
   // ONE IMMEDIATE FIELD PER TILE. `dicemap.pgraph.split_operands` folds the
   // FIRST literal operand that fits and MATERIALISES every other literal on
