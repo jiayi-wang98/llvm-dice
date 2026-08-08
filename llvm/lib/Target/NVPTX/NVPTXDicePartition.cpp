@@ -144,6 +144,22 @@ struct Cost {
   // `xbar_mem_addr`, so `[%r1+4]` is lowered to an in-fabric `add.s32`. This
   // one is NOT deduplicated -- each access needs its own adder.
   unsigned DispAdds = 0;
+
+  // rule 7: A FOLDED LITERAL WITH AN ARCHITECTURAL DESTINATION STILL HAS TO BE
+  // WRITTEN. `mov.b32 %r2, -1` folds into every consumer INSIDE the p-graph and
+  // is still listed in OUT_REGS, so a tile has to produce the value for the
+  // writeback lane. This pass runs before DiceRegAlloc, so there are no
+  // architectural registers yet -- "architectural" is approximated by "the
+  // destination has a use outside this basic block", which the region scan
+  // resolves because only it knows the block. A `%w` wire is exactly a vreg
+  // with no out-of-block use, so the approximation is the definition.
+  //
+  // It is charged HERE rather than left to C4 because it BITES: kmeans
+  // `DICE_BB1_3` ends in `mov.b32 %r2, -1; mov.b32 %r10, 0`, both live out, and
+  // without them the block costs 16 of 16 and is not split while the mapper
+  // needs 18. That is a VERIFIED kernel's artifact refused by the legality gate.
+  Register FoldedMovDef;
+  uint32_t FoldedMovValue = 0;
 };
 
 class NVPTXDicePartition : public MachineFunctionPass {
@@ -443,8 +459,17 @@ static Cost classify(const MachineInstr &MI, const TargetInstrInfo &TII,
       if (MO.isGlobal()) {
         C.MatSymbols.push_back(MO.getGlobal());
       } else if (std::optional<uint32_t> K = literalPattern(MO)) {
-        if (!immFits(int64_t(int32_t(*K)), DiceImmBits))
+        if (!immFits(int64_t(int32_t(*K)), DiceImmBits)) {
           C.MatConsts.push_back(*K);
+        } else if (Name.starts_with("MOV") || Name.starts_with("IMOV")) {
+          // Folds into the consumers; rule 7 decides whether a tile is
+          // nevertheless owed, and only the region scan can tell.
+          for (const MachineOperand &D : MI.defs())
+            if (D.isReg() && D.getReg().isVirtual()) {
+              C.FoldedMovDef = D.getReg();
+              C.FoldedMovValue = *K;
+            }
+        }
       }
     }
     return C;
@@ -667,6 +692,17 @@ bool llvm::nvptxDiceRepartition(MachineFunction &MF) {
       SmallVector<uint32_t, 4> NewMat;
       SmallVector<const GlobalValue *, 2> NewMatSyms;
       unsigned MatPE = 0;
+      // rule 7, resolved here because only the region scan knows the block: a
+      // folded `mov` literal whose destination is used OUTSIDE this block has to
+      // be materialised for the writeback lane.
+      if (C.FoldedMovDef) {
+        const MachineRegisterInfo &MRI = MF.getRegInfo();
+        for (const MachineInstr &U : MRI.use_nodbg_instructions(C.FoldedMovDef))
+          if (U.getParent() != MBB) {
+            C.MatConsts.push_back(C.FoldedMovValue);
+            break;
+          }
+      }
       for (uint32_t K : C.MatConsts)
         if (!MatValues.count(K) && !llvm::is_contained(NewMat, K)) {
           NewMat.push_back(K);
