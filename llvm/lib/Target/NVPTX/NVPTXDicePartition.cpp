@@ -48,6 +48,7 @@
 #include "llvm/CodeGen/MachineInstr.h"
 #include "llvm/CodeGen/MachineInstrBuilder.h"
 #include "llvm/CodeGen/MachineMemOperand.h"
+#include "llvm/IR/Constants.h"
 #include "llvm/CodeGen/TargetInstrInfo.h"
 #include "llvm/CodeGen/TargetSubtargetInfo.h"
 #include "llvm/Support/CommandLine.h"
@@ -76,6 +77,13 @@ static cl::opt<unsigned> DiceLDSTCount(
     "nvptx-dice-ldst-count", cl::init(4), cl::Hidden,
     cl::desc("DICE p-graph LDST port budget"));
 
+static cl::opt<unsigned> DiceImmBits(
+    "nvptx-dice-imm-bits", cl::init(16), cl::Hidden,
+    cl::desc("Width of the SIGNED immediate field a PE tile's configuration "
+             "holds (device fabric.pe.immediate_bits; 0 = none). A literal "
+             "that fits folds into the tile for free; one that does not has to "
+             "be MATERIALISED on tiles of its own, and that is a PE cost"));
+
 static cl::opt<unsigned> DiceConstReadCount(
     "nvptx-dice-const-reads", cl::init(0), cl::Hidden,
     cl::desc("DICE p-graph distinct constant-file read budget; 0 (default) "
@@ -91,6 +99,43 @@ struct Cost {
   // The def of a load or atomic is not readable inside the p-graph that
   // issued it.
   bool DefsArriveLate = false;
+
+  // ---- TILES THE MAPPER SYNTHESISES, which are PE cost this pass owes -----
+  //
+  // AN INSTRUCTION COUNT IS NOT A TILE COUNT, and until 2026-08-07 this pass
+  // assumed it was. The fabric has no way to produce a literal or a memory
+  // displacement other than a tile, so `dicemap.pgraph` synthesises one --
+  // and the partitioner, charging one PE per arithmetic instruction and
+  // nothing else, emitted p-graphs the mapper then refused as
+  // `resource_oversubscribed`. Measured over all 538 p-graphs of the bundled
+  // corpus on 2026-08-07:
+  //
+  //   | uncharged ALU tile                                   | occurrences |
+  //   |------------------------------------------------------|-------------|
+  //   | ld/st with a nonzero bracket displacement            |         202 |
+  //   | mov of a .shared SYMBOL (the address is a literal)   |         145 |
+  //   | a selp literal operand (the phi mux has no imm path) |          28 |
+  //   | a literal too wide for the tile immediate            |          15 |
+  //   | a SECOND literal on one node (one imm field/tile)    |           6 |
+  //
+  // FOUR p-graphs of the corpus exceed the 16 ALU tiles, and every one of them
+  // does so BECAUSE OF THESE and for no other reason: hotspot and hotspot_fp32
+  // `DICE_BB0_7` (17 int) and `DICE_BB0_8` (19 int), and kmeans `DICE_BB1_3`
+  // (21 int). That is the whole of hotspot_fp32's `resource_oversubscribed`
+  // and the whole of kmeans fn1's.
+  //
+  // MATERIALISED CONSTANTS ARE SHARED WITHIN A P-GRAPH, keyed by the 32-bit
+  // pattern (`dicemap.pgraph`'s `const_nodes` dict), so the cost cannot be a
+  // per-instruction addend: two `selp`s selecting 15 pay for one tile between
+  // them. These vectors are therefore CANDIDATES that the region-level scan
+  // deduplicates, not a charge.
+  SmallVector<uint32_t, 4> MatConsts;
+  SmallVector<const GlobalValue *, 2> MatSymbols;
+  // rule 1: THE FABRIC IS THE ONLY ADDER. `pgraph_meta_t` carries no
+  // displacement field and the LDST port takes the address straight off
+  // `xbar_mem_addr`, so `[%r1+4]` is lowered to an in-fabric `add.s32`. This
+  // one is NOT deduplicated -- each access needs its own adder.
+  unsigned DispAdds = 0;
 };
 
 class NVPTXDicePartition : public MachineFunctionPass {
@@ -158,6 +203,129 @@ static bool isFreeIntWidthCvt(StringRef Name) {
          DstW != SrcW;
 }
 
+/// Does `Value` fit a signed `Bits`-wide tile immediate field?
+/// The mirror of `dicevfy.ir.imm_fits` / `dicemap.fabric.ImmediatePolicy.fits`.
+static bool immFits(int64_t Value, unsigned Bits) {
+  if (Bits == 0 || Bits > 63)
+    return Bits > 63;
+  return Value >= -(int64_t(1) << (Bits - 1)) &&
+         Value <= (int64_t(1) << (Bits - 1)) - 1;
+}
+
+/// ALU tiles spent MATERIALISING the 32-bit pattern `K`, or 0 if it cannot be.
+///
+/// The mirror of `dicemap.pgraph`'s `const_node` and of
+/// `dicevfy.ir.materialisation_tiles`: one tile when the SIGNED value fits the
+/// field (`and.b32 K, K` -- both operand muxes select the tile's own immediate
+/// and `K AND K == K`); otherwise the halves, `and`+`shl` for a nonzero high
+/// half, `and` for a nonzero low half plus `shl`+`shr` when its bit 15 is set
+/// (the field is SIGN-extended by `imm_const_32b`, so a low half of 0x999A
+/// arrives with every top bit on), plus an `or` to join two halves. Six tiles
+/// at the worst, which is what a float literal like 0f3E99999A costs -- so one
+/// `mul.f32 %r, %r, 0f3E99999A` is SEVEN tiles, not one.
+static unsigned matTiles(uint32_t K, unsigned Bits) {
+  int64_t Signed = int64_t(int32_t(K));
+  if (immFits(Signed, Bits))
+    return 1;
+  if (Bits < 16)
+    return 0; // the mapper refuses such a device by name rather than splitting
+  uint32_t Hi = (K >> 16) & 0xFFFF, Lo = K & 0xFFFF;
+  unsigned Tiles = 0, Parts = 0;
+  if (Hi) {
+    Tiles += 2; // and.b32 hi, hi + shl.b32 16
+    ++Parts;
+  }
+  if (Lo) {
+    Tiles += 1; // and.b32 lo, lo
+    if (Lo & 0x8000)
+      Tiles += 2; // shl.b32 16 + shr.u32 16 to zero-extend
+    ++Parts;
+  }
+  if (Parts == 2)
+    Tiles += 1; // or.b32
+  return Tiles;
+}
+
+/// The 32-bit pattern a literal MachineOperand carries, if it is one.
+///
+/// A float literal is charged BY ITS BIT PATTERN because that is what the tile
+/// has to produce: `dicemap.pgraph`'s `_any_literal` reads `0f3E99999A` as the
+/// integer 0x3E99999A and materialises exactly that.
+static std::optional<uint32_t> literalPattern(const MachineOperand &MO) {
+  if (MO.isImm())
+    return uint32_t(uint64_t(MO.getImm()) & 0xFFFFFFFFu);
+  if (MO.isCImm())
+    return uint32_t(MO.getCImm()->getValue().getZExtValue() & 0xFFFFFFFFu);
+  if (MO.isFPImm()) {
+    APFloat F = MO.getFPImm()->getValueAPF();
+    // fp64 IS DELIBERATELY NOT CHARGED, and it mirrors a mapper LIMITATION
+    // rather than a saving: `dicemap.pgraph.resolve` gates a literal on
+    // `is_immediate`, whose regex accepts int and `0f` but not `0d`, so an fp64
+    // literal operand is DROPPED -- no node and no tile. Those p-graphs are the
+    // ones dice-fasm already refuses for the fp64 register pair
+    // (docs/device-contract.md 5.5e item 5), so charging here would make this
+    // pass disagree with the mapper on a path that cannot run either way.
+    if (&F.getSemantics() != &APFloat::IEEEsingle())
+      return std::nullopt;
+    return F.bitcastToAPInt().getZExtValue() & 0xFFFFFFFFu;
+  }
+  return std::nullopt;
+}
+
+/// `selp` EXECUTES ON THE PHI MUX, whose data_true/data_false inputs have no
+/// immediate path at all (unlike the ALU/cmp/bitwise operand muxes), so EVERY
+/// literal operand of a selp has to be materialised -- including BOTH of
+/// `selp.b32 %r8, 1, 0, %p0`. `dicemap.pgraph` says so in as many words when it
+/// passes `allow_fold = policy.enabled and inst.base_opcode != "selp"`.
+static bool isSelpName(StringRef Name) { return Name.starts_with("SELP_"); }
+
+/// Tiles a memory access spends on its bracket DISPLACEMENT (0 or 1).
+///
+/// THE FABRIC IS THE ONLY ADDER. mini_dice's LDST port takes the address
+/// straight off `xbar_mem_addr` (`dice_cgra_rf`: `cgra_mem_addr_lo[p] =
+/// fab_mem_addr_o[p]`, no offset) and `pgraph_meta_t` carries no displacement
+/// field, so `dicemap.pgraph` lowers `[%r1+4]` to a real in-fabric `add.s32`
+/// with the 4 in the tile immediate. 202 accesses in the corpus have one, and
+/// the partitioner charged them an LDST port and no PE at all.
+///
+/// NVPTX addresses a load/store as (base, offset) with the OFFSET LAST -- the
+/// `ADDRri` complex pattern, printed as `LD_i32 0, 0, 1, 3, 32, -1, %62:b64, 0`
+/// where the trailing 0 is the offset. Reading the last use operand is how the
+/// asm printer itself finds it, so it does not depend on the opcode name.
+/// A memory access's literal ADDRESS operands, which are tiles like any other.
+///
+/// `st.shared.u32 [_ZZ..temp], %r6` addresses a `.shared` symbol directly: the
+/// address is a literal, so the mapper materialises it (needle's `DICE_BB1_3`
+/// and `DICE_BB2_20` are one tile each and nothing else). A literal DATA
+/// operand that fits the field folds into the memory tile's own configuration
+/// on a device whose memory units ARE array tiles, which every device in
+/// `device/` with LDST tiles is; one that does not fit materialises.
+static void collectMemLiterals(const MachineInstr &MI, Cost &C) {
+  for (const MachineOperand &MO : MI.uses()) {
+    if (MO.isGlobal()) {
+      C.MatSymbols.push_back(MO.getGlobal());
+      continue;
+    }
+    if (std::optional<uint32_t> K = literalPattern(MO))
+      if (!immFits(int64_t(int32_t(*K)), DiceImmBits))
+        C.MatConsts.push_back(*K);
+  }
+}
+
+static unsigned memDisplacementAdds(const MachineInstr &MI) {
+  const MachineOperand *Last = nullptr;
+  for (const MachineOperand &MO : MI.uses())
+    Last = &MO;
+  if (!Last)
+    return 0;
+  if (Last->isImm())
+    return Last->getImm() != 0 ? 1 : 0;
+  // A global-address offset (`[sym+8]`) is an address the mapper materialises
+  // outright rather than an add on a routed base, so it is charged as a
+  // MatSymbol by the caller and costs no adder here.
+  return 0;
+}
+
 static Cost classify(const MachineInstr &MI, const TargetInstrInfo &TII,
                      bool InPureParamBlock) {
   Cost C;
@@ -179,6 +347,8 @@ static Cost classify(const MachineInstr &MI, const TargetInstrInfo &TII,
     if (!isParamLoad(MI)) {
       C.LDST = 1;
       C.DefsArriveLate = true;
+      C.DispAdds = memDisplacementAdds(MI);
+      collectMemLiterals(MI, C);
     } else if (!InPureParamBlock) {
       // Hardware loads parameters ONCE per CTA into the constant RF -- but
       // only for IS_PARAMETER_LOAD blocks (dispatch-once). A param load
@@ -193,6 +363,8 @@ static Cost classify(const MachineInstr &MI, const TargetInstrInfo &TII,
   }
   if (MI.mayStore()) {
     C.LDST = 1;
+    C.DispAdds = memDisplacementAdds(MI);
+    collectMemLiterals(MI, C);
     return C;
   }
 
@@ -205,8 +377,29 @@ static Cost classify(const MachineInstr &MI, const TargetInstrInfo &TII,
   // routes them), special-register reads (mov.u32 %r, %tid.x).
   if (Name.starts_with("CVTA") || isFreeIntWidthCvt(Name) ||
       Name.starts_with("MOV") || Name.starts_with("IMOV") ||
-      Name.starts_with("INT_PTX_SREG"))
+      Name.starts_with("INT_PTX_SREG")) {
+    // A `mov` is free ROUTING, unless what it names is NOT A REGISTER.
+    //
+    //  * `MOV_B64_sym @_ZZ..temp_on_cuda` asks for the ADDRESS of a `.shared`
+    //    array. An address is a literal, and there is no crossbar source for a
+    //    literal, so the mapper materialises it on a tile. 145 of these in the
+    //    corpus, and two of them are why hotspot's `DICE_BB0_8` needs 19 tiles.
+    //  * a literal too WIDE for the tile immediate cannot wait for a consumer
+    //    to fold it, so it materialises here and now. `mov.b32 %w0, 0f41800000`
+    //    is two tiles.
+    //
+    // A `mov` of a literal that FITS stays free: the consumer folds it into its
+    // own immediate field, and if some consumer cannot, the consumer pays.
+    for (const MachineOperand &MO : MI.uses()) {
+      if (MO.isGlobal()) {
+        C.MatSymbols.push_back(MO.getGlobal());
+      } else if (std::optional<uint32_t> K = literalPattern(MO)) {
+        if (!immFits(int64_t(int32_t(*K)), DiceImmBits))
+          C.MatConsts.push_back(*K);
+      }
+    }
     return C;
+  }
 
   // fp64 COSTS AN SFU TILE, and this line was missing until 2026-08-06.
   //
@@ -235,6 +428,28 @@ static Cost classify(const MachineInstr &MI, const TargetInstrInfo &TII,
   }
 
   C.PE = 1;
+
+  // ONE IMMEDIATE FIELD PER TILE. `dicemap.pgraph.split_operands` folds the
+  // FIRST literal operand that fits and MATERIALISES every other literal on
+  // the same node, "because a tile's configuration holds a single immediate
+  // field". `selp` folds none at all (`isSelpName`, above).
+  bool Folded = false;
+  bool AllowFold = DiceImmBits > 0 && !isSelpName(Name);
+  for (const MachineOperand &MO : MI.uses()) {
+    if (MO.isGlobal()) {
+      C.MatSymbols.push_back(MO.getGlobal());
+      continue;
+    }
+    std::optional<uint32_t> K = literalPattern(MO);
+    if (!K)
+      continue;
+    int64_t Signed = int64_t(int32_t(*K));
+    if (AllowFold && !Folded && immFits(Signed, DiceImmBits)) {
+      Folded = true;
+      continue;
+    }
+    C.MatConsts.push_back(*K);
+  }
   return C;
 }
 
@@ -351,6 +566,12 @@ bool llvm::nvptxDiceRepartition(MachineFunction &MF) {
 
     unsigned UsedPE = 0, UsedSFU = 0, UsedLDST = 0;
     DenseSet<Register> LateDefs, UsedConsts;
+    // MATERIALISED CONSTANTS ARE SHARED WITHIN A P-GRAPH, keyed by the 32-bit
+    // pattern for a literal and by the symbol for an address -- so this is a
+    // region-level SET, exactly as `dicemap.pgraph`'s `const_nodes` dict is,
+    // and two `selp`s selecting 15 pay for one tile between them.
+    DenseSet<uint32_t> MatValues;
+    DenseSet<const GlobalValue *> MatSyms;
     MachineInstr *LastReal = nullptr;
     bool PureParam = true;
     for (const MachineInstr &PMI : *MBB) {
@@ -383,7 +604,37 @@ bool llvm::nvptxDiceRepartition(MachineFunction &MF) {
 
       Cost C = classify(MI, TII, PureParam);
 
-      if (C.PE > DicePECount || C.SFU > DiceSFUCount || C.LDST > DiceLDSTCount)
+      // What this instruction ADDS to the region's materialisation set. A value
+      // already materialised here is free; the tiles for a new one are
+      // `matTiles`, which is 1 for a literal that fits the field and up to SIX
+      // for one that does not.
+      SmallVector<uint32_t, 4> NewMat;
+      SmallVector<const GlobalValue *, 2> NewMatSyms;
+      unsigned MatPE = 0;
+      for (uint32_t K : C.MatConsts)
+        if (!MatValues.count(K) && !llvm::is_contained(NewMat, K)) {
+          NewMat.push_back(K);
+          MatPE += matTiles(K, DiceImmBits);
+        }
+      for (const GlobalValue *GV : C.MatSymbols)
+        if (!MatSyms.count(GV) && !llvm::is_contained(NewMatSyms, GV)) {
+          NewMatSyms.push_back(GV);
+          // A `.shared` SYMBOL ADDRESS is charged ONE tile, and that is exact
+          // for every symbol in the bundled corpus (measured: all 145 cost 1)
+          // but not a guarantee. This pass cannot know the address: the layout
+          // is `dicemap.pgraph.shared_symbol_layout` over the module's `.shared`
+          // sizes offset by `dice-map --smem-base`, which is a MAPPER input and
+          // not a compiler one. A shared block that pushed a symbol above the
+          // tile immediate would cost up to six tiles and this would undercharge
+          // by five. dice-verify's C4 computes the exact number from the artifact
+          // and the device file, so the case is CAUGHT rather than silent -- it
+          // is named here so it is not mistaken for exactness.
+          MatPE += 1;
+        }
+      unsigned InstPE = C.PE + C.DispAdds + MatPE;
+
+      if (InstPE > DicePECount || C.SFU > DiceSFUCount ||
+          C.LDST > DiceLDSTCount)
         report_fatal_error(Twine("DICE: instruction exceeds a p-graph budget "
                                  "alone: ") +
                            TII.getName(MI.getOpcode()));
@@ -411,7 +662,7 @@ bool llvm::nvptxDiceRepartition(MachineFunction &MF) {
       bool NeedSplit =
           !RegionEmpty &&
           (C.IsBarrier || UsesLateDef ||
-           UsedPE + C.PE > DicePECount || UsedSFU + C.SFU > DiceSFUCount ||
+           UsedPE + InstPE > DicePECount || UsedSFU + C.SFU > DiceSFUCount ||
            UsedLDST + C.LDST > DiceLDSTCount ||
            (DiceConstReadCount &&
             UsedConsts.size() + NewConsts.size() > DiceConstReadCount));
@@ -428,10 +679,12 @@ bool llvm::nvptxDiceRepartition(MachineFunction &MF) {
         break;
       }
 
-      UsedPE += C.PE;
+      UsedPE += InstPE;
       UsedSFU += C.SFU;
       UsedLDST += C.LDST;
       UsedConsts.insert(NewConsts.begin(), NewConsts.end());
+      MatValues.insert(NewMat.begin(), NewMat.end());
+      MatSyms.insert(NewMatSyms.begin(), NewMatSyms.end());
       if (C.DefsArriveLate)
         for (const MachineOperand &MO : MI.defs())
           if (MO.isReg())
@@ -573,6 +826,12 @@ char NVPTXDiceFuse::ID = 0;
 struct BlockCost {
   unsigned PE = 0, SFU = 0, LDST = 0;
   DenseSet<Register> Consts;
+  // The SAME region-level materialisation sets the splitter keeps. Fusing two
+  // blocks whose PE counts sum to 16 is illegal if either spends tiles on a
+  // literal, so the fuser has to account for them or it would undo the splits
+  // the partitioner just made.
+  DenseSet<uint32_t> MatValues;
+  DenseSet<const GlobalValue *> MatSyms;
   bool HasBarrier = false, HasRet = false, PureParam = true, Real = false;
 };
 } // namespace
@@ -594,7 +853,13 @@ static BlockCost blockCost(const MachineBasicBlock &MBB,
     Cost C = classify(MI, TII, /*InPureParamBlock=*/false);
     if (C.IsBarrier)
       B.HasBarrier = true;
-    B.PE += C.PE;
+    B.PE += C.PE + C.DispAdds;
+    for (uint32_t K : C.MatConsts)
+      if (B.MatValues.insert(K).second)
+        B.PE += matTiles(K, DiceImmBits);
+    for (const GlobalValue *GV : C.MatSymbols)
+      if (B.MatSyms.insert(GV).second)
+        B.PE += 1;
     B.SFU += C.SFU;
     B.LDST += C.LDST;
     for (const MachineOperand &MO : MI.uses())
@@ -650,6 +915,10 @@ bool NVPTXDiceFuse::runOnMachineFunction(MachineFunction &MF) {
                 CB = blockCost(B, TII, ParamConstDefs);
       if (CB.HasBarrier || CB.HasRet || CA.PureParam || CB.PureParam)
         continue;
+      // `CA.PE + CB.PE` OVER-counts a literal the two blocks share, because
+      // each already paid for it inside its own set. That is the SAFE direction
+      // for a fuse decision -- it refuses a legal fusion rather than allowing an
+      // illegal one -- and `-nvptx-dice-opt-fuse` is off by default anyway.
       if (CA.PE + CB.PE > DicePECount || CA.SFU + CB.SFU > DiceSFUCount ||
           CA.LDST + CB.LDST > DiceLDSTCount)
         continue;
