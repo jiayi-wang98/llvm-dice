@@ -332,7 +332,7 @@ static unsigned subwordCvtTiles(StringRef Name) {
 
 /// Tiles a memory access spends on its bracket DISPLACEMENT (0 or 1).
 ///
-/// THE FABRIC IS THE ONLY ADDER. mini_dice's LDST port takes the address
+/// THE FABRIC IS THE ONLY ADDER. dice_v2's LDST port takes the address
 /// straight off `xbar_mem_addr` (`dice_cgra_rf`: `cgra_mem_addr_lo[p] =
 /// fab_mem_addr_o[p]`, no offset) and `pgraph_meta_t` carries no displacement
 /// field, so `dicemap.pgraph` lowers `[%r1+4]` to a real in-fabric `add.s32`
