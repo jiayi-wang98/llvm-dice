@@ -356,8 +356,23 @@ bool NVPTXDiceRegAlloc::runOnMachineFunction(MachineFunction &MF) {
 
   // Spill-and-retry: when the pool does not suffice, spill the intervals
   // that failed to color, re-partition (the reloads force load-to-use
-  // splits and can overflow LDST budgets), and start over. Each round
-  // strictly shrinks the failed values' live ranges, so this terminates.
+  // splits and can overflow LDST budgets), and start over.
+  //
+  // WHY IT TERMINATES, stated correctly (this said "each round strictly
+  // shrinks the failed values' live ranges" until 2026-08-09, which is not the
+  // argument and is not even true -- re-partitioning renumbers blocks, so an
+  // interval can come back LONGER). The real argument: every register
+  // `colorIntervals` pushes into `Failed` is a NON-ARTIFACT (the `NoEvict`
+  // guards make an artifact unevictable, and an artifact that cannot be
+  // colored takes the `Worst >= 0` branch and displaces a non-artifact
+  // instead), and `insertSpills` replaces each spilled register with fresh
+  // artifacts, so the set of non-artifact vregs strictly shrinks by at least
+  // one per round. That bounds the loop by the vreg count.
+  //
+  // MaxRounds is therefore NOT the termination bound -- it is a budget. Round
+  // MaxRounds-1 passes `Failed = nullptr`, which turns a coloring failure into
+  // `report_fatal_error("pool exhausted")`. A function that genuinely needs
+  // more than 23 spill rounds fails to compile rather than converging slowly.
   unsigned SpillOffset = 0;
   DenseSet<Register> SpillArtifacts;
   const unsigned MaxRounds = 24;
