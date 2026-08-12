@@ -578,7 +578,21 @@ bool NVPTXDiceRegAlloc::runOnMachineFunction(MachineFunction &MF) {
     }
     return Out + ")";
   };
-  // Latency model, mirroring config/base_u1.json latency_model.
+  // Latency model. This cited `config/base_u1.json latency_model` until
+  // 2026-08-12; that file was DELETED on 2026-08-09 as a stale second copy of
+  // the device spec that no code read (DICE-IDE review 01 finding F12), so the
+  // citation named nothing. The corresponding device-file keys are
+  // `compiler.latency_model.{default,fp32_op,int_mul,special}` in
+  // device/dice_v2.yaml.
+  //
+  // NOTE THE LITERALS BELOW ARE NOT DRIVEN BY IT. `tools/dicc` forwards the
+  // device's register pools and budgets as -nvptx-dice-* flags, but there is no
+  // -nvptx-dice-latency channel, so these values are an independent copy -- the
+  // last one in this file. That yaml block is marked `_documentation_only`
+  // precisely because nothing reads it; do not treat it as authoritative for the
+  // HARDWARE, which publishes `fabric.pe.alu_latency` (checked against the
+  // fabric's own scheduling.latency_cycles) and `fabric.pe.fpu_latency`. This is
+  // the COMPILER'S ESTIMATE for LAT, and dice-pack may pad it.
   auto InstLat = [&](const MachineInstr &MI) -> unsigned {
     StringRef N = TII.getName(MI.getOpcode());
     if (N.contains("DIV") || N.contains("SQRT") || N.contains("EX2") ||
