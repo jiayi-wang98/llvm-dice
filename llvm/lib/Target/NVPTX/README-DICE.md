@@ -7,9 +7,14 @@ model (Wang, Lu, Zeng, Li, *"DICE: Enabling Efficient General-Purpose SIMT
 Execution with Statically Scheduled Coarse-Grained Reconfigurable Arrays"*,
 ISCA 2026, [arXiv:2605.05496](https://arxiv.org/abs/2605.05496)).
 
-Nothing outside `llvm/lib/Target/NVPTX/` is touched. The delta is six new files
-plus modifications to nine pre-existing ones; `git diff <base> HEAD --stat` shows
-the whole of it.
+The delta is **17 files** (`git diff <base> HEAD --stat`; the line total is not
+quoted here because this document is one of the seventeen and would count itself):
+seven new files under `llvm/lib/Target/NVPTX/` — the six DICE passes
+and this document — plus modifications to nine pre-existing files there, plus a
+17-line DICE banner on the **repository-root `README.md`**, which is what makes this
+fork's landing page point here. That banner is the only part of the delta outside
+`llvm/lib/Target/NVPTX/`, and it is deliberate; nothing else may leave the subtree
+(see [If you change this directory, mirror it](#if-you-change-this-directory-mirror-it)).
 
 ```
 git clone -b dice-compiler-backend git@github.com:jiayi-wang98/llvm-dice.git
@@ -334,9 +339,10 @@ these 15.
 > machine with eight predicate registers that do not exist. Consequences,
 > measured in DICE-IDE (see the docstring of `device_backend_flags` in
 > `tools/dicc`): the allocator's `colorIntervals` is first-fit and takes the
-> lowest free colour, no kernel in the 22-kernel corpus ever selected `%p16` or
-> above, and all 22 recompile byte-identically at 16 — so today the difference is
-> latent rather than active. But a kernel that really needs a 17th predicate
+> lowest free colour, the highest predicate index across the 293 `.pptx` the current
+> backend has produced is `%p10` (particlefilter) and never `%p16`, and all 22
+> buildable corpus kernels recompile byte-identically at 16 — so today the
+> difference is latent rather than active. But a kernel that really needs a 17th predicate
 > compiles happily at the default and is then refused *by name* much later, by
 > `dice-verify` check C5 and by `dice-pack`'s register bitmap; at 16 it fails
 > inside the allocator instead ("DICE regalloc: %p pool exhausted in <fn>"),
@@ -441,17 +447,20 @@ does not vendor LLVM:
 ### If you change this directory, mirror it
 
 DICE-IDE vendors this delta at `llvm/dice/`: the new files verbatim in
-`llvm/dice/new/`, the nine modified files as `llvm/dice/upstream.patch`, against
-the base commit pinned in `deps/pins.ini`. `tools/dice-bootstrap-tests/`
-reconstructs the branch from base + delta and diffs the **whole**
-`llvm/lib/Target/NVPTX` subtree, so *any* new file here — including this README,
-which is vendored as `llvm/dice/new/README-DICE.md` — must be added there too, or
-the two routes to the backend diverge and that test fails. Keep the copies
-byte-identical. `deps/pins.ini`'s `local_branch_commit` records this branch's tip
-and `dice-bootstrap verify`'s `llvm-fork-refs` row compares it to the pushed
-fork, so a local commit that is not pushed is reported rather than silently
+`llvm/dice/new/`, the **ten** modified files as `llvm/dice/upstream.patch` — the nine
+NVPTX ones and the root `README.md` — against the base commit pinned in
+`deps/pins.ini`. `tools/dice-bootstrap-tests/` reconstructs the branch from base +
+delta and diffs `bootstrap.VENDORED_PATHS`, which is the **whole**
+`llvm/lib/Target/NVPTX` subtree **and** the root `README.md`. So *any* new file here
+— including this README, which is vendored as `llvm/dice/new/README-DICE.md` — must
+be added there too, or the two routes to the backend diverge and that test fails.
+Keep the copies byte-identical. `deps/pins.ini`'s `local_branch_commit` records this
+branch's tip and `dice-bootstrap verify`'s `llvm-fork-refs` row compares it to the
+pushed fork, so a local commit that is not pushed is reported rather than silently
 shipping two different compilers.
 
-Nothing outside `llvm/lib/Target/NVPTX/` may be modified. If a change needs
+Nothing outside those two paths may be modified. A second test enforces exactly
+that: `upstream.patch` may touch `llvm/lib/Target/NVPTX/**` and `README.md`, and
+nothing else (`allowed_outside = {"README.md"}`). If a change needs
 `llvm/lib/CodeGen` or `clang/`, the pin stops describing the build and the
 vendoring test fails — correctly.
