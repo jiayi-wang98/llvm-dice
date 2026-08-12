@@ -1,3 +1,20 @@
+<!-- DICE FORK BANNER -- not part of upstream LLVM. -->
+> ## This is the DICE compiler fork of LLVM
+>
+> Branch **`dice-compiler-backend`** adds a DICE backend to NVPTX: it compiles CUDA
+> to *partitioned PTX* (`.pptx`) plus a metadata sidecar (`.meta`) describing
+> **p-graphs** — the dataflow blocks a DICE CGRA configures and executes.
+>
+> **→ [`llvm/lib/Target/NVPTX/README-DICE.md`](llvm/lib/Target/NVPTX/README-DICE.md)**
+> is the entry point: how to build it, every `-nvptx-dice-*` flag with its real
+> default, the pass order, and a worked example with its actual output.
+>
+> You do **not** need anything else to work on the compiler. The rest of the DICE
+> stack — mapper, bitstream generation, RTL, verification — lives in DICE-IDE,
+> which vendors this delta and pins this branch.
+>
+> Everything below this banner is upstream LLVM's own README.
+
 # The LLVM Compiler Infrastructure
 
 [![OpenSSF Scorecard](https://api.securityscorecards.dev/projects/github.com/llvm/llvm-project/badge)](https://securityscorecards.dev/viewer/?uri=github.com/llvm/llvm-project)
